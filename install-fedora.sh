@@ -999,11 +999,6 @@ EOF
 install_nvidia() {
     [[ "$NVIDIA" == "yes" ]] || return 0
     say "Installing the NVIDIA 580xx driver"
-    local ver
-    ver=$(target rpm -E %fedora)
-    target dnf -y install \
-        "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${ver}.noarch.rpm" \
-        "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${ver}.noarch.rpm"
     if ! target dnf -y install akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx nvidia-settings-580xx; then
         say "The driver could not be built in this live system. It will build on first boot."
         target dnf -y install --setopt=tsflags=noscripts \
@@ -1014,7 +1009,7 @@ install_nvidia() {
 }
 
 ensure_rpmfusion() {
-    target rpm -q rpmfusion-nonfree-release >/dev/null 2>&1 && return 0
+    target rpm -q rpmfusion-free-release rpmfusion-nonfree-release >/dev/null 2>&1 && return 0
     local ver
     ver=$(target rpm -E %fedora)
     target dnf -y install \
@@ -1022,22 +1017,21 @@ ensure_rpmfusion() {
         "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${ver}.noarch.rpm"
 }
 
-install_apps() {
-    [[ "$APPS" == "none" ]] && return 0
-    say "Installing selected applications"
-    if app_selected discord || app_selected steam; then
+configure_app_repositories() {
+    say "Configuring repositories for selected applications"
+    mkdir -p "$MNT/etc/yum.repos.d"
+    if [[ "$NVIDIA" == yes ]] || app_selected discord || app_selected steam; then
         ensure_rpmfusion
     fi
     if app_selected chrome; then
         cat > "$MNT/etc/yum.repos.d/google-chrome.repo" <<'EOF'
 [google-chrome]
 name=google-chrome
-baseurl=http://dl.google.com/linux/chrome/rpm/stable/x86_64
+baseurl=https://dl.google.com/linux/chrome/rpm/stable/x86_64
 enabled=1
 gpgcheck=1
 gpgkey=https://dl.google.com/linux/linux_signing_key.pub
 EOF
-        target dnf -y install google-chrome-stable
     fi
     if app_selected vscode; then
         target rpm --import https://packages.microsoft.com/keys/microsoft.asc
@@ -1049,23 +1043,15 @@ enabled=1
 gpgcheck=1
 gpgkey=https://packages.microsoft.com/keys/microsoft.asc
 EOF
-        target dnf -y install code
     fi
-    if app_selected warp || app_selected cloudflared; then
+    if app_selected warp; then
         target rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
         curl -fsSL -o "$MNT/etc/yum.repos.d/cloudflare-warp.repo" \
             https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo
     fi
-    if app_selected warp; then
-        target dnf -y install cloudflare-warp
-    fi
     if app_selected cloudflared; then
-        if ! target dnf -y install cloudflared; then
-            curl -fL --retry 3 -o /tmp/cloudflared-linux-x86_64.rpm \
-                https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm
-            cp /tmp/cloudflared-linux-x86_64.rpm "$MNT/tmp/cloudflared-linux-x86_64.rpm"
-            target dnf -y install /tmp/cloudflared-linux-x86_64.rpm
-        fi
+        curl -fsSL --retry 3 -o "$MNT/etc/yum.repos.d/cloudflared.repo" \
+            https://pkg.cloudflare.com/cloudflared.repo
     fi
     if app_selected cursor; then
         cat > "$MNT/etc/yum.repos.d/cursor.repo" <<'EOF'
@@ -1076,10 +1062,6 @@ enabled=1
 gpgcheck=1
 gpgkey=https://downloads.cursor.com/keys/anysphere.asc
 EOF
-        target dnf -y install cursor
-    fi
-    if app_selected discord; then
-        target dnf -y install discord
     fi
     if app_selected docker; then
         cat > "$MNT/etc/yum.repos.d/docker-ce.repo" <<'EOF'
@@ -1091,12 +1073,29 @@ gpgcheck=1
 gpgkey=https://download.docker.com/linux/fedora/gpg
 EOF
         target rpm --import https://download.docker.com/linux/fedora/gpg || true
-        target dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+}
+
+install_apps() {
+    [[ "$APPS" == "none" ]] && return 0
+    say "Installing selected applications in one transaction"
+    local -a packages=()
+    if app_selected chrome; then packages+=(google-chrome-stable); fi
+    if app_selected vscode; then packages+=(code); fi
+    if app_selected warp; then packages+=(cloudflare-warp); fi
+    if app_selected cloudflared; then packages+=(cloudflared); fi
+    if app_selected cursor; then packages+=(cursor); fi
+    if app_selected discord; then packages+=(discord); fi
+    if app_selected steam; then packages+=(steam); fi
+    if app_selected docker; then
+        packages+=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+    fi
+    # DNF loads metadata for all configured repositories during this solve.
+    # A separate makecache/update before install would repeat that work.
+    target dnf -y install "${packages[@]}"
+    if app_selected docker; then
         enable_unit docker.service
         target usermod -aG docker "$USER_NAME"
-    fi
-    if app_selected steam; then
-        target dnf -y install steam
     fi
 }
 
@@ -1220,6 +1219,7 @@ main() {
         configure_ly_selinux
     fi
     install_efi
+    configure_app_repositories
     install_nvidia
     install_apps
     install_configs
