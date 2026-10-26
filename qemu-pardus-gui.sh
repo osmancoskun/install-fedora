@@ -74,7 +74,7 @@ exec qemu-system-x86_64 \
     -smp 4 \
     -display gtk,gl=off \
     -device virtio-vga \
-    -usb -device usb-tablet \
+    -device qemu-xhci -device usb-tablet \
     -audio none \
     -drive if=pflash,format=qcow2,readonly=on,file="$CODE" \
     -drive if=pflash,format=qcow2,file="$VARS" \

@@ -8,8 +8,15 @@ printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4
 apt-get update
 apt-get install -y util-linux
 
-losetup -fP /work/out/disk.img
-DEV=$(losetup -j /work/out/disk.img | awk -F: 'NR==1 { print $1 }')
+# The loop-control ioctl may allocate a loop whose /dev node is absent in
+# this container's static /dev. Create only the free node returned by it.
+DEV=$(losetup -f)
+if [[ ! -b "$DEV" ]]; then
+    minor=${DEV#/dev/loop}
+    [[ "$minor" =~ ^[0-9]+$ ]] || { echo "Unexpected loop device: $DEV" >&2; exit 1; }
+    mknod "$DEV" b 7 "$minor"
+fi
+losetup -P "$DEV" /work/out/disk.img
 [[ -b "$DEV" ]] || { echo "loop device missing" >&2; exit 1; }
 echo "Installing onto $DEV"
 
@@ -37,26 +44,36 @@ bash /work/install-fedora.sh \
     --timezone Europe/Istanbul \
     --kernel-arg 'console=ttyS0,115200' \
     --ssh-authorized-key /work/out/test_key.pub \
+    --no-nvram \
     --yes
 
 partx -u "$DEV" || true
 # Partition nodes created with mknod go stale if the kernel renumbers them.
 base=$(basename "$DEV")
 for name in "${base}p1" "${base}p2" "${base}p3"; do
-    [[ -b "/dev/$name" ]] && continue
     [[ -r "/sys/class/block/$name/dev" ]] || continue
     IFS=: read -r major minor < "/sys/class/block/$name/dev"
-    mknod "/dev/$name" b "$major" "$minor"
+    expected=$(printf '%x:%x' "$major" "$minor")
+    actual=$(stat -Lc '%t:%T' "/dev/$name" 2>/dev/null || true)
+    if [[ ! -b "/dev/$name" || "$actual" != "$expected" ]]; then
+        rm -f -- "/dev/$name"
+        mknod "/dev/$name" b "$major" "$minor"
+    fi
 done
 EFI="/dev/${base}p1"
 BOOT="/dev/${base}p2"
 ROOTP="/dev/${base}p3"
 mkdir -p /mnt/check
 mount -o subvol=root "$ROOTP" /mnt/check
+chroot /mnt/check matchpathcon -V /home /boot
+mount -o subvol=home "$ROOTP" /mnt/check/home
+mount "$BOOT" /mnt/check/boot
+mount "$EFI" /mnt/check/boot/efi
+chroot /mnt/check matchpathcon -V / /dev /proc /sys /run /home/osman /etc/shadow /boot/grub2/grub.cfg
 echo "---- boot entry ----"
 grep -H . /mnt/check/boot/loader/entries/*.conf
 test -f /mnt/check/boot/efi/EFI/BOOT/BOOTX64.EFI
-test -e /mnt/check/etc/systemd/system/multi-user.target.wants/ly@tty2.service
+chroot /mnt/check test -e /etc/systemd/system/multi-user.target.wants/ly@tty2.service
 test ! -e /mnt/check/usr/bin/sddm
 umount -R /mnt/check
 losetup -d "$DEV"
@@ -148,6 +165,14 @@ if rpm -q sddm >/dev/null 2>&1; then
 fi
 findmnt -no FSTYPE / | grep -qx btrfs
 grep -q 'rootflags=subvol=root' /proc/cmdline
+test "$(getenforce)" = Enforcing
+! grep -Eq '(^| )(selinux=0|enforcing=0)( |$)' /proc/cmdline
+sudo -S -p '' passwd -S root <<<'Fedora-qemu-1' | grep -Eq '^root P '
+rpm -q sway-config-fedora selinux-policy-targeted
+matchpathcon -V /usr/bin/ly
+ps -C ly -o label= | grep -q ':xdm_t:'
+fc-match sans-serif
+fc-match monospace
 echo BOOT_OK
 REMOTE
 
