@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Bootstrap Fedora onto a disk from any live Linux (Debian, Fedora, Arch, …).
-# This does not use Anaconda. It unpacks a Fedora rootfs, then installs
-# packages with the target's own dnf, the way debootstrap does for Debian.
+# This does not use Anaconda or a container rootfs. It builds a minimal
+# Fedora base from signed official RPMs, then installs @core and the desktop
+# using Fedora's own DNF.
 #
 # Interactive questions: disk, username, password, NVIDIA, display manager,
 # dotfiles, applications.
@@ -19,6 +20,8 @@ CACHE_DIR="${FEDORA_INSTALL_CACHE:-/var/tmp/fedora-install-cache}"
 MIN_BYTES=$((16 * 1024 * 1024 * 1024))
 
 ASSUME_YES=0
+REPAIR_LY_SELINUX=0
+WRITE_NVRAM=1
 DISK=""
 USER_NAME=""
 PASSWORD=""
@@ -34,6 +37,8 @@ EXTRA_KERNEL_ARGS=()
 MNT=""
 ROOT_UUID=""
 BOOT_UUID=""
+BOOTSTRAP=""
+BOOTSTRAP_WORK=""
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -51,7 +56,7 @@ Questions (skipped when the matching option is passed):
   password          that account, also used for root
   NVIDIA            install the 580xx driver used by GTX 10-series
   display manager   ly, sddm, or none
-  configs           clone and stow osmancoskun/dotfiles, plus Oh My Zsh
+  configs           your dotfiles, plus Oh My Zsh
   applications      Chrome, VS Code, WARP, cloudflared, Cursor, Discord,
                     Docker CE, Steam
 
@@ -68,12 +73,18 @@ Options:
   --release N              Fedora release (default: 44)
   --kernel-arg ARG         extra kernel command-line argument (repeatable)
   --ssh-authorized-key FILE
+  --no-nvram               install EFI fallback without changing firmware entries
+  --repair-ly-selinux       repair ly policy on the running installed Fedora system
   --yes                    do not ask for a final confirmation
   -h, --help
 EOF
 }
 
 while (($#)); do
+    case "$1" in
+        --disk|--user|--password|--nvidia|--dm|--configs|--apps|--hostname|--timezone|--release|--kernel-arg|--ssh-authorized-key)
+            (( $# >= 2 )) || die "missing value for $1" ;;
+    esac
     case "$1" in
         --disk) DISK=$2; shift 2 ;;
         --user) USER_NAME=$2; shift 2 ;;
@@ -88,6 +99,8 @@ while (($#)); do
         --kernel-arg) EXTRA_KERNEL_ARGS+=("$2"); shift 2 ;;
         --ssh-authorized-key) SSH_KEY=$2; shift 2 ;;
         --yes) ASSUME_YES=1; shift ;;
+        --no-nvram) WRITE_NVRAM=0; shift ;;
+        --repair-ly-selinux) REPAIR_LY_SELINUX=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -162,12 +175,13 @@ choose_disk() {
 
 validate_disk() {
     [[ -b "$DISK" ]] || die "$DISK is not a block device"
-    local type pk root_src root_disk
+    local type root_src root_disk
     type=$(lsblk -dno TYPE "$DISK")
     case "$type" in
         disk|loop) ;;
         *) die "$DISK is not a whole disk (type: ${type:-unknown})" ;;
     esac
+    DISK=$(readlink -f "$DISK")
     local name
     name=$(basename "$DISK")
     [[ "$name" =~ ^(zram|ram|fd|sr) ]] && die "$DISK cannot be an install target"
@@ -182,9 +196,19 @@ validate_disk() {
         fi
     fi
 
-    if lsblk -no MOUNTPOINTS "$DISK" | grep -q '[^[:space:]]'; then
+    local mountpoints
+    mountpoints=$(lsblk -no MOUNTPOINTS "$DISK")
+    if [[ -n "${mountpoints//[[:space:]]/}" ]]; then
         die "$DISK has a mounted filesystem. Unmount it first."
     fi
+
+    local swapdev ancestor
+    while read -r swapdev; do
+        [[ -b "$swapdev" ]] || continue
+        while read -r ancestor; do
+            [[ "$(readlink -f "$ancestor")" != "$DISK" ]] || die "$DISK contains active swap"
+        done < <(lsblk -srpno NAME "$swapdev")
+    done < <(swapon --show=NAME --noheadings --raw)
 
     local bytes
     bytes=$(blockdev --getsize64 "$DISK")
@@ -217,6 +241,9 @@ confirm_wipe() {
 }
 
 ask_questions() {
+    [[ "$(uname -m)" == x86_64 ]] || die "this installer currently supports x86_64 only"
+    [[ "$RELEASE" =~ ^[0-9]+$ ]] || die "--release must be a Fedora release number"
+    [[ -z "$SSH_KEY" || -r "$SSH_KEY" ]] || die "ssh key not readable: $SSH_KEY"
     choose_disk
 
     if [[ -z "$USER_NAME" ]]; then
@@ -317,6 +344,18 @@ ask_questions() {
     fi
 }
 
+validate_install_options() {
+    local extra
+    for extra in "${EXTRA_KERNEL_ARGS[@]}"; do
+        [[ -n "$extra" && "$extra" != *[[:space:]]* ]] || die "pass each kernel argument separately, without whitespace"
+        case "$extra" in
+            selinux=*|enforcing=*) die "SELinux kernel options are managed by the installer" ;;
+        esac
+        [[ "$extra" != *'"'* && "$extra" != *'`'* && "$extra" != *'$'* && "$extra" != *\\* && "$extra" != *$'\n'* ]] || die "unsupported characters in kernel argument"
+    done
+    [[ -f "$BOOTSTRAP/usr/share/zoneinfo/$TIMEZONE" && "$TIMEZONE" != /* && "$TIMEZONE" != *..* ]] || die "invalid timezone: $TIMEZONE"
+}
+
 apps_from_line() {
     local line=$1
     line=${line//,/ }
@@ -411,15 +450,15 @@ ensure_host_tools() {
     command -v mkfs.ext4 >/dev/null || need[e2fsprogs]=1
     command -v mkfs.btrfs >/dev/null || need[btrfs-progs]=1
     command -v curl >/dev/null || need[curl]=1
-    command -v tar >/dev/null || need[tar]=1
-    if ! command -v xz >/dev/null; then
-        local pm
-        pm=$(host_package_manager)
-        if [[ "$pm" == "apt" ]]; then
-            need[xz-utils]=1
-        else
-            need[xz]=1
-        fi
+    command -v dnf >/dev/null || need[dnf]=1
+    if ! command -v rpmkeys >/dev/null; then
+        if [[ "$(host_package_manager)" == pacman ]]; then need[rpm-tools]=1; else need[rpm]=1; fi
+    fi
+    if ! command -v gpg >/dev/null; then
+        case "$(host_package_manager)" in
+            apt|pacman) need[gnupg]=1 ;;
+            *) need[gnupg2]=1 ;;
+        esac
     fi
     ((${#need[@]})) || return 0
 
@@ -452,23 +491,32 @@ cleanup() {
         umount -R "$MNT" 2>/dev/null
         rmdir "$MNT" 2>/dev/null
     fi
+    if [[ -n "$BOOTSTRAP_WORK" ]]; then
+        rm -rf -- "$BOOTSTRAP_WORK"
+    fi
 }
 trap cleanup EXIT
 
 ensure_part_node() {
-    local n=$1 node name major minor
+    local n=$1 node name major minor expected actual
     node=$(part_dev "$n")
-    [[ -b "$node" ]] && return 0
     name=$(basename "$node")
     [[ -r "/sys/class/block/$name/dev" ]] || return 1
     IFS=: read -r major minor < "/sys/class/block/$name/dev"
+    expected=$(printf '%x:%x' "$major" "$minor")
+    actual=$(stat -Lc '%t:%T' "$node" 2>/dev/null || true)
+    if [[ -b "$node" && "$actual" == "$expected" ]]; then
+        return 0
+    fi
+    # Static container /dev nodes can outlive a partition's kernel dev_t.
+    rm -f -- "$node"
     mknod "$node" b "$major" "$minor"
     [[ -b "$node" ]]
 }
 
 wait_parts() {
-    local i
-    for i in 1 2 3 4 5 6 7 8; do
+    local attempt
+    for ((attempt=0; attempt<8; attempt++)); do
         partx -u "$DISK" 2>/dev/null || true
         ensure_part_node 1 || true
         ensure_part_node 2 || true
@@ -515,33 +563,75 @@ EOF
     mount "$efi" "$MNT/boot/efi"
 }
 
-fetch_rootfs() {
-    local index latest url dest
-    index="https://images.linuxcontainers.org/images/fedora/${RELEASE}/amd64/default/"
-    say "Looking up the Fedora ${RELEASE} rootfs"
-    latest=$(curl -fsSL "$index" | grep -oE '20[0-9]{6}_[0-9]{2}:[0-9]{2}/' | tail -1)
-    [[ -n "$latest" ]] || die "no Fedora ${RELEASE} rootfs published at $index"
-    url="${index}${latest}rootfs.tar.xz"
+prepare_minimal_base() {
+    # Complete bootstrap before touching the destination disk. Never reuse a
+    # container filesystem, host repositories, or a partially installed root.
     mkdir -p "$CACHE_DIR"
-    dest="$CACHE_DIR/fedora-${RELEASE}-rootfs.tar.xz"
-    if [[ -s "$dest" ]]; then
-        say "Using cached rootfs $dest"
-    else
-        say "Downloading $url"
-        curl -fL --retry 3 -o "$dest.partial" "$url"
-        mv "$dest.partial" "$dest"
-    fi
-    say "Unpacking Fedora into $MNT"
-    tar -C "$MNT" --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*' --exclude='./run/*' -xJf "$dest"
+    BOOTSTRAP_WORK=$(mktemp -d "$CACHE_DIR/bootstrap.XXXXXX")
+    BOOTSTRAP="$BOOTSTRAP_WORK/root"
+    mkdir -p "$BOOTSTRAP" "$BOOTSTRAP_WORK/repos" "$BOOTSTRAP_WORK/gnupg"
+    chmod 700 "$BOOTSTRAP_WORK/gnupg"
+    curl -fL --retry 3 -o "$BOOTSTRAP_WORK/fedora.gpg" https://fedoraproject.org/fedora.gpg
+    gpg --batch --no-options --homedir "$BOOTSTRAP_WORK/gnupg" \
+        --no-default-keyring --keyring "$BOOTSTRAP_WORK/fedora.gpg" \
+        --armor --export > "$BOOTSTRAP_WORK/fedora.asc"
+    [[ -s "$BOOTSTRAP_WORK/fedora.asc" ]] || die "Fedora signing keys are empty"
+    cat > "$BOOTSTRAP_WORK/dnf.conf" <<EOF
+[main]
+gpgcheck=1
+reposdir=$BOOTSTRAP_WORK/repos
+EOF
+    cat > "$BOOTSTRAP_WORK/repos/bootstrap.repo" <<EOF
+[bootstrap-fedora]
+name=Fedora $RELEASE
+metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$RELEASE&arch=x86_64
+enabled=1
+gpgcheck=1
+gpgkey=file://$BOOTSTRAP_WORK/fedora.asc
+[bootstrap-updates]
+name=Fedora $RELEASE updates
+metalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$RELEASE&arch=x86_64
+enabled=1
+gpgcheck=1
+gpgkey=file://$BOOTSTRAP_WORK/fedora.asc
+EOF
+    # Keep Debian/Arch RPM defaults out of the new Fedora RPM database.
+    # HOME affects this one invocation, including its rpmkeys subprocess.
+    mkdir -p "$BOOTSTRAP_WORK/rpm-home"
+    printf '%%_dbpath /usr/lib/sysimage/rpm\n' > "$BOOTSTRAP_WORK/rpm-home/.rpmmacros"
+    say "Building Fedora $RELEASE minimal base from signed official RPMs"
+    # Do not resolve groups with the live system's libcomps. In particular,
+    # Debian 13/Pardus 25's libcomps can crash under Python 3.13 when DNF
+    # iterates group metadata. Fedora's own DNF installs @core below.
+    HOME="$BOOTSTRAP_WORK/rpm-home" dnf -y --config="$BOOTSTRAP_WORK/dnf.conf" --installroot="$BOOTSTRAP" \
+        --releasever="$RELEASE" --setopt="module_platform_id=platform:f$RELEASE" \
+        --setopt="reposdir=$BOOTSTRAP_WORK/repos" --setopt=install_weak_deps=False \
+        --disablerepo='*' --enablerepo=bootstrap-fedora --enablerepo=bootstrap-updates \
+        install bash coreutils filesystem glibc-langpack-en dnf fedora-release-sway \
+        systemd systemd-udev sudo shadow-utils passwd util-linux tzdata \
+        ca-certificates curl selinux-policy-targeted policycoreutils
+    [[ -x "$BOOTSTRAP/usr/bin/dnf" ]] || die "minimal Fedora bootstrap is incomplete"
+    chroot "$BOOTSTRAP" rpm -q fedora-release-sway systemd selinux-policy-targeted
+
+    # A new installation must have its own machine identity.
+    : > "$BOOTSTRAP/etc/machine-id"
+}
+
+copy_minimal_base() {
+    say "Copying the minimal Fedora base into $MNT"
+    cp -a "$BOOTSTRAP/." "$MNT/"
     mkdir -p "$MNT"/{dev,proc,sys,run,boot/efi,home}
 }
 
 mount_api() {
     mount --bind /dev "$MNT/dev"
+    mount --make-private "$MNT/dev"
     mount --bind /proc "$MNT/proc"
+    mount --make-private "$MNT/proc"
     mount --bind /sys "$MNT/sys"
+    mount --make-private "$MNT/sys"
     mount -t tmpfs tmpfs "$MNT/run"
-    if [[ -d /sys/firmware/efi/efivars ]]; then
+    if (( WRITE_NVRAM )) && [[ -d /sys/firmware/efi/efivars ]]; then
         mkdir -p "$MNT/sys/firmware/efi/efivars"
         mount -t efivarfs efivarfs "$MNT/sys/firmware/efi/efivars" || true
     fi
@@ -554,13 +644,57 @@ mount_api() {
 }
 
 target() {
-    chroot "$MNT" "$@"
+    if (( REPAIR_LY_SELINUX )); then
+        "$@"
+    else
+        chroot "$MNT" "$@"
+    fi
+}
+
+configure_ly_selinux() {
+    say "Installing SELinux policy for ly"
+    target dnf -y install systemd-pam selinux-policy-devel make
+    # Backport Fedora's ly policy: Fedora 44 does not ship ly-selinux.
+    # Source: Fedora ly SRPM's ly.te/ly.fc (MIT).
+    # Run ly in the existing display-manager domain instead of allowing all
+    # unconfined services to transition into user sessions.
+    target bash -s -- "$REPAIR_LY_SELINUX" <<'EOF'
+set -euo pipefail
+policy_dir=/usr/local/share/fedora-install/ly-selinux
+install -d -m 755 "$policy_dir"
+cat > "$policy_dir/fedora_install_ly.te" <<'POLICY'
+policy_module(fedora_install_ly, 1.0.0)
+
+gen_require(`
+    type getty_t, xdm_t, xdm_exec_t;
+')
+
+domtrans_pattern(getty_t, xdm_exec_t, xdm_t)
+userdom_setattr_user_ttys(xdm_t)
+POLICY
+cat > "$policy_dir/fedora_install_ly.fc" <<'CONTEXTS'
+/usr/bin/ly           -- gen_context(system_u:object_r:xdm_exec_t,s0)
+/var/lib/ly(/.*)?        gen_context(system_u:object_r:xdm_var_lib_t,s0)
+/etc/ly/save\.txt     -- gen_context(system_u:object_r:xdm_var_lib_t,s0)
+/var/log/ly\.log      -- gen_context(system_u:object_r:xdm_log_t,s0)
+CONTEXTS
+make -C "$policy_dir" -f /usr/share/selinux/devel/Makefile fedora_install_ly.pp
+install -d -m 755 /var/lib/ly
+# Fedora 44's ly stores its saved selection under /etc rather than /var/lib.
+# Precreate it so the display-manager domain only needs to update the file.
+touch /etc/ly/save.txt /var/log/ly.log
+if [[ "$1" == 1 ]]; then
+    semodule -i "$policy_dir/fedora_install_ly.pp"
+    restorecon -RF /usr/bin/ly /var/lib/ly /etc/ly/save.txt /var/log/ly.log
+else
+    semodule -n -i "$policy_dir/fedora_install_ly.pp"
+fi
+EOF
 }
 
 write_boot_config() {
     local cmdline args
-    # selinux=0: this install is not labeled, and enforcing mode freezes systemd.
-    args="root=UUID=${ROOT_UUID} ro rootflags=subvol=root rhgb quiet selinux=0"
+    args="root=UUID=${ROOT_UUID} ro rootflags=subvol=root rhgb quiet selinux=1 enforcing=1"
     if [[ "$NVIDIA" == "yes" ]]; then
         args+=" nvidia-drm.modeset=1 rd.driver.blacklist=nouveau,nova_core modprobe.blacklist=nouveau,nova_core"
     fi
@@ -612,6 +746,7 @@ EOF
 EOF
     ln -sfn "/usr/share/zoneinfo/${TIMEZONE}" "$MNT/etc/localtime"
     printf 'LANG=en_US.UTF-8\n' > "$MNT/etc/locale.conf"
+    mkdir -p "$MNT/etc/sudoers.d"
     printf '%%wheel ALL=(ALL) ALL\n' > "$MNT/etc/sudoers.d/wheel"
     chmod 440 "$MNT/etc/sudoers.d/wheel"
 
@@ -628,8 +763,10 @@ install_base_packages() {
         grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr
         btrfs-progs e2fsprogs dosfstools
         NetworkManager openssh-server firewalld sudo shadow-utils passwd
-        zram-generator-defaults polkit curl ca-certificates
-        @swaywm @swaywm-extended
+        zram-generator-defaults polkit curl ca-certificates systemd-pam
+        @core @swaywm @swaywm-extended @fonts
+        sway-config-fedora selinux-policy-targeted policycoreutils
+        glibc-langpack-en fontconfig
     )
     local -a excludes=()
     case "$DM" in
@@ -674,22 +811,43 @@ enable_unit() {
     ln -sfn "$src" "$MNT/etc/systemd/system/${target_name}.wants/$unit"
 }
 
-relax_selinux() {
+configure_selinux() {
     mkdir -p "$MNT/etc/selinux"
-    if [[ -f "$MNT/etc/selinux/config" ]]; then
-        sed -i 's/^SELINUX=.*/SELINUX=permissive/' "$MNT/etc/selinux/config"
-    else
-        printf '%s\n' 'SELINUX=permissive' 'SELINUXTYPE=targeted' > "$MNT/etc/selinux/config"
-    fi
+    printf '%s\n' 'SELINUX=enforcing' 'SELINUXTYPE=targeted' > "$MNT/etc/selinux/config"
+}
+
+label_filesystems() {
+    say "Labeling the installed system for SELinux enforcing mode"
+    # Unmount host APIs and the FAT ESP before labeling. This also exposes
+    # the underlying mountpoint directories, which need their own labels.
+    local path
+    for path in dev proc sys run boot/efi; do
+        umount -R "$MNT/$path"
+    done
+    # No /proc is mounted now; -m avoids consulting the host mount table.
+    # setfiles stops at filesystem boundaries, so name /home and /boot explicitly.
+    target setfiles -m -F /etc/selinux/targeted/contexts/files/file_contexts / /home /boot
+    # Label the underlying root filesystem's /home and /boot directories too.
+    umount "$MNT/home" "$MNT/boot"
+    target setfiles -m -F /etc/selinux/targeted/contexts/files/file_contexts /home /boot
+
 }
 
 configure_system() {
-    relax_selinux
+    configure_selinux
 
     mkdir -p "$MNT/etc/security/pwquality.conf.d"
     printf '%s\n' 'minlen = 8' 'dictcheck = 0' > "$MNT/etc/security/pwquality.conf.d/installer.conf"
     target useradd -m -G wheel -s /bin/bash "$USER_NAME"
-    printf '%s\n' "${USER_NAME}:${PASSWORD}" "root:${PASSWORD}" | target chpasswd
+    printf '%s\n' "${USER_NAME}:${PASSWORD}" | target chpasswd
+    local password_hash
+    password_hash=$(target getent shadow "$USER_NAME" | cut -d: -f2)
+    printf 'root:%s\n' "$password_hash" | target chpasswd -e
+    unset PASSWORD password_hash
+
+    target usermod -U root
+    target usermod -s /bin/bash root
+    target chage -E -1 root
 
     enable_unit NetworkManager.service
     enable_unit sshd.service
@@ -781,11 +939,11 @@ WantedBy=multi-user.target
 EOF
     enable_unit fedora-install-regen-grub.service
 
-    if [[ -d /sys/firmware/efi/efivars ]]; then
+    if (( WRITE_NVRAM )) && [[ -d /sys/firmware/efi/efivars ]]; then
         target efibootmgr -c -d "$DISK" -p 1 -L Fedora -l '\EFI\fedora\shimx64.efi' || \
             say "efibootmgr could not add an NVRAM entry; the EFI/BOOT fallback is still in place"
     else
-        say "This live system is not booted in UEFI mode, so no NVRAM entry was created."
+        say "No NVRAM entry was created (disabled or the live system uses legacy boot)."
         say "The disk still has \\EFI\\BOOT\\BOOTX64.EFI. Switch the firmware to UEFI and boot this disk."
     fi
 }
@@ -982,13 +1140,23 @@ EOF
 }
 
 verify_install() {
+    [[ -f "$MNT/usr/lib64/security/pam_systemd.so" ]] || die "systemd PAM session support is missing"
     [[ -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || die "EFI fallback bootloader is missing"
     compgen -G "$MNT/boot/loader/entries/*.conf" >/dev/null || die "no boot loader entry was created"
     grep -q "root=UUID=${ROOT_UUID}" "$MNT"/boot/loader/entries/*.conf || die "boot entry is missing the root filesystem"
     grep -q 'rootflags=subvol=root' "$MNT"/boot/loader/entries/*.conf || die "boot entry is missing the btrfs subvolume"
+    grep -qx 'SELINUX=enforcing' "$MNT/etc/selinux/config" || die "SELinux is not enforcing"
+    local root_hash user_hash
+    root_hash=$(target getent shadow root | cut -d: -f2)
+    user_hash=$(target getent shadow "$USER_NAME" | cut -d: -f2)
+    [[ -n "$user_hash" && "$root_hash" == "$user_hash" ]] || die "root password does not match user password"
+    [[ "$(target passwd -S root | awk '{print $2}')" == P ]] || die "root account is locked"
     [[ -x "$MNT/usr/bin/sway" ]] || die "sway was not installed"
     case "$DM" in
-        ly) [[ -x "$MNT/usr/bin/ly" ]] || die "ly was not installed" ;;
+        ly)
+            [[ -x "$MNT/usr/bin/ly" ]] || die "ly was not installed"
+            target matchpathcon -n /usr/bin/ly | grep -q ':xdm_exec_t:' || die "ly SELinux policy is missing"
+            ;;
         sddm) [[ -x "$MNT/usr/bin/sddm" ]] || die "sddm was not installed" ;;
     esac
 }
@@ -1005,31 +1173,43 @@ EOF
 }
 
 main() {
+    if (( REPAIR_LY_SELINUX )); then
+        configure_ly_selinux
+        say "ly SELinux policy repaired. Restart ly@tty2.service to apply it."
+        return
+    fi
     ensure_host_tools
     ask_questions
     validate_disk
     confirm_wipe
+    prepare_minimal_base
+    validate_install_options
+    validate_disk
     partition_disk
-    fetch_rootfs
+    copy_minimal_base
     mount_api
     write_boot_config
     install_base_packages
     configure_system
+    if [[ "$DM" == ly ]]; then
+        configure_ly_selinux
+    fi
     install_efi
     install_nvidia
     install_apps
     install_configs
     # A later package install can restore the stock enforcing policy config.
-    relax_selinux
+    configure_selinux
     verify_install
     write_stamp
     target dnf -y clean all || true
+    label_filesystems
     sync
     say ""
     say "Fedora ${RELEASE} is installed on ${DISK}."
     say "  UEFI boot file: \\EFI\\BOOT\\BOOTX64.EFI"
     say "  user ${USER_NAME}, root password is the same"
-    say "  SELinux is permissive because the install was not labeled by Anaconda."
+    say "  SELinux is enforcing; installed files have been labeled."
     if [[ "$NVIDIA" == "yes" ]]; then
         say "  At ly, pick the Sway Custom session."
     fi
