@@ -56,7 +56,7 @@ Questions (skipped when the matching option is passed):
   password          that account, also used for root
   NVIDIA            install the 580xx driver used by GTX 10-series
   display manager   ly, sddm, or none
-  configs           your dotfiles, plus Oh My Zsh
+  configs           desktop, shell and editor dotfiles (automatic displays), plus Oh My Zsh
   applications      Chrome, VS Code, WARP, cloudflared, Cursor, Discord,
                     Docker CE, Steam
 
@@ -303,7 +303,7 @@ ask_questions() {
 
     if [[ -z "$CONFIGS" ]]; then
         [[ -r /dev/tty ]] || die "--configs is required when there is no terminal"
-        prompt_yes_no CONFIGS "Install your dotfiles and Oh My Zsh ($DOTFILES_URL)" yes
+        prompt_yes_no CONFIGS "Install desktop, shell and editor dotfiles (automatic displays) and Oh My Zsh ($DOTFILES_URL)" yes
     else
         CONFIGS=$(normalize_yes_no "$CONFIGS") || die "--configs must be yes or no"
     fi
@@ -782,7 +782,8 @@ install_base_packages() {
             ;;
     esac
     if [[ "$CONFIGS" == "yes" ]]; then
-        pkgs+=(git stow zsh)
+        pkgs+=(git zsh vim-enhanced foot alacritty waybar rofi jq
+            cascadia-code-fonts fontawesome-6-free-fonts fontawesome-6-brands-fonts)
     fi
     say "Installing the base system (this downloads the desktop and kernel)"
     target dnf -y install "${excludes[@]}" "${pkgs[@]}"
@@ -1102,23 +1103,47 @@ EOF
 install_configs() {
     [[ "$CONFIGS" == "yes" ]] || return 0
     say "Installing dotfiles and Oh My Zsh"
-    if [[ ! -d "$MNT/home/${USER_NAME}/.dotfiles/.git" ]]; then
-        target git clone --depth 1 "$DOTFILES_URL" "/home/${USER_NAME}/.dotfiles"
-    fi
-    target chown -R "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.dotfiles"
-    # useradd copies /etc/skel/.zshrc from the zsh package. Stow will not
-    # replace that regular file unless it is removed first.
-    target runuser -u "$USER_NAME" -- bash -s <<'EOF'
+    target runuser -u "$USER_NAME" -- bash -s -- "$DOTFILES_URL" <<'EOF'
 set -euo pipefail
-cd "$HOME/.dotfiles/home"
-while IFS= read -r -d '' src; do
-    dest="$HOME/${src#./}"
-    if [[ -e "$dest" && ! -L "$dest" ]]; then
-        echo "replacing existing $dest"
-        rm -rf "$dest"
+repo="$HOME/.dotfiles"
+if [[ ! -d "$repo/.git" ]]; then
+    git clone --depth 1 --filter=blob:none --no-checkout "$1" "$repo"
+fi
+# Only portable desktop files are checked out. Old display layouts stay out.
+git -C "$repo" sparse-checkout set --no-cone \
+    '/home/.zshrc' '/home/.vimrc' \
+    '/home/.config/sway/' '/home/.config/waybar/' \
+    '/home/.config/foot/' '/home/.config/alacritty/' \
+    '!/home/.config/sway/config.d/*monitor*' \
+    '!/home/.config/sway/scripts/*monitor*' \
+    '!/home/.config/sway/wallpaper-daily.env'
+git -C "$repo" checkout
+backup() {
+    if [[ -e "$1" || -L "$1" ]]; then
+        mv -- "$1" "$1.before-fedora-install.$(date +%s%N)"
     fi
-done < <(find . -mindepth 1 \( -type f -o -type l \) -print0)
-stow --restow --target="$HOME" --dir="$HOME/.dotfiles" home
+}
+for name in .zshrc .vimrc; do
+    [[ -f "$repo/home/$name" ]] || continue
+    dest="$HOME/$name"
+    [[ -L "$dest" && $(readlink "$dest") == "$repo/home/$name" ]] && continue
+    backup "$dest"
+    ln -s "$repo/home/$name" "$dest"
+done
+mkdir -p "$HOME/.config"
+for name in sway waybar foot alacritty; do
+    [[ -d "$repo/home/.config/$name" ]] || continue
+    backup "$HOME/.config/$name"
+    cp -a "$repo/home/.config/$name" "$HOME/.config/$name"
+done
+if [[ -f "$HOME/.config/sway/config" ]]; then
+    # Drop the old laptop scale and any workspace/output assignments.
+    # Sway detects connected outputs and chooses their preferred modes.
+    sed -i -E '/^[[:space:]]*output[[:space:]]/d; /^[[:space:]]*workspace[[:space:]].*[[:space:]]output[[:space:]]/d' "$HOME/.config/sway/config"
+fi
+if [[ -f "$HOME/.config/sway/wallpaper-daily.env.example" ]]; then
+    cp "$HOME/.config/sway/wallpaper-daily.env.example" "$HOME/.config/sway/wallpaper-daily.env"
+fi
 EOF
     target runuser -u "$USER_NAME" -- bash -s <<'EOF'
 set -euo pipefail
